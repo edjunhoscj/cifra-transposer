@@ -262,14 +262,54 @@ function b64ToArr(b64){
   return arr;
 }
 
-/** Tenta extrair texto via PDF.js (funciona em PDFs com texto seleccionável) */
+/** Extrai texto via PDF.js preservando layout espacial (agrupa por linha via Y) */
 async function extractTextPdfJs(b64){
   const pdf = await pdfjsLib.getDocument({data: b64ToArr(b64)}).promise;
   let text = '';
-  for (let i=1; i<=pdf.numPages; i++){
-    const page = await pdf.getPage(i);
+  for (let i = 1; i <= pdf.numPages; i++){
+    const page    = await pdf.getPage(i);
     const content = await page.getTextContent();
-    text += content.items.map(it=>it.str).join(' ') + '\n';
+    const vp      = page.getViewport({scale:1});
+
+    // Agrupa items por linha (Y próximo)
+    const items = content.items.filter(it => it.str.trim());
+    if (!items.length){ text += '\n'; continue; }
+
+    // Normaliza Y (PDF usa Y de baixo pra cima, invertemos)
+    const pageH = vp.height;
+    const withY = items.map(it => ({
+      str: it.str,
+      x:   it.transform[4],
+      y:   pageH - it.transform[5],
+      w:   it.width
+    })).sort((a,b) => a.y - b.y || a.x - b.x);
+
+    // Agrupa em linhas
+    const lines = [];
+    let cur = [withY[0]];
+    for (let j = 1; j < withY.length; j++){
+      const prev = cur[cur.length-1];
+      if (Math.abs(withY[j].y - prev.y) <= 6){
+        cur.push(withY[j]);
+      } else {
+        lines.push([...cur]);
+        cur = [withY[j]];
+      }
+    }
+    lines.push(cur);
+
+    // Reconstrói cada linha com espaçamento
+    for (const line of lines){
+      const ls = line.sort((a,b) => a.x - b.x);
+      let row  = ls[0].str;
+      for (let j = 1; j < ls.length; j++){
+        const gap    = ls[j].x - (ls[j-1].x + (ls[j-1].w || 0));
+        const spaces = gap > 12 ? ' '.repeat(Math.max(1, Math.round(gap/6))) : ' ';
+        row += spaces + ls[j].str;
+      }
+      text += row + '\n';
+    }
+    text += '\n';
   }
   return {text: text.trim(), pdf};
 }
@@ -291,9 +331,72 @@ async function renderPagesToImages(pdf, onProgress){
   return images;
 }
 
-/** OCR via Tesseract.js (lazy load) */
+/**
+ * Reconstrói linhas de texto a partir das bounding boxes das palavras.
+ * Agrupa palavras com centros Y próximos na mesma linha e preserva
+ * o espaçamento horizontal — essencial para cifras onde acordes ficam
+ * acima das sílabas correspondentes.
+ */
+function reconstructLinesFromWords(words){
+  if (!words || !words.length) return '';
+
+  // Filtra palavras com baixa confiança ou vazias
+  const valid = words.filter(w => w.confidence > 25 && w.text.trim().length > 0);
+  if (!valid.length) return '';
+
+  // Ordena por Y depois por X
+  const sorted = [...valid].sort((a,b) => a.bbox.y0 - b.bbox.y0 || a.bbox.x0 - b.bbox.x0);
+
+  // Agrupa em linhas: palavras cujos centros Y estão dentro de 60% da altura de uma palavra
+  const lines = [];
+  let cur = [sorted[0]];
+  for (let i = 1; i < sorted.length; i++){
+    const w    = sorted[i];
+    const prev = cur[cur.length - 1];
+    const prevH    = prev.bbox.y1 - prev.bbox.y0;
+    const prevCenY = (prev.bbox.y0 + prev.bbox.y1) / 2;
+    const currCenY = (w.bbox.y0   + w.bbox.y1)    / 2;
+    if (Math.abs(currCenY - prevCenY) <= prevH * 0.65){
+      cur.push(w);
+    } else {
+      lines.push([...cur]);
+      cur = [w];
+    }
+  }
+  lines.push(cur);
+
+  // Para cada linha, reconstrói com espaçamento proporcional
+  return lines.map(line => {
+    const ls = line.sort((a,b) => a.bbox.x0 - b.bbox.x0);
+    let text = ls[0].text;
+    for (let i = 1; i < ls.length; i++){
+      const gap      = ls[i].bbox.x0 - ls[i-1].bbox.x1;
+      const charW    = (ls[i].bbox.x1 - ls[i].bbox.x0) / Math.max(ls[i].text.length, 1);
+      const spaces   = Math.max(1, Math.round(gap / Math.max(charW, 6)));
+      text += ' '.repeat(spaces) + ls[i].text;
+    }
+    return text;
+  }).join('\n');
+}
+
+/**
+ * Corrige artefatos comuns de OCR em acordes:
+ * "G # m7" → "G#m7", "A # 7" → "A#7", "Bb 7" → "Bb7"
+ */
+function fixOcrChords(text){
+  return text
+    // "G # m" → "G#m"  /  "D # m7" → "D#m7"
+    .replace(/\b([A-G])\s+#\s*(m(?:aj)?7?|min7?|M7?|maj7?|7|9|11|13|dim7?|aug|sus[24]?|add\d+|6|4|2)?/g,
+      (_, n, q) => n + '#' + (q||''))
+    // "G b m" → "Gbm"
+    .replace(/\b([A-G])\s+b\s*(m(?:aj)?7?|min7?|M7?|maj7?|7|9|11|13|dim7?|aug|sus[24]?|add\d+|6|4|2)?(?=[^a-z]|$)/g,
+      (_, n, q) => n + 'b' + (q||''))
+    // "Bb 7" → "Bb7", "Am 7" → "Am7"
+    .replace(/\b([A-G][#b]?m?)\s+(7|9|11|13|maj7?|min7?|dim7?|sus[24]?)\b/g, '$1$2');
+}
+
+/** OCR via Tesseract.js com reconstrução espacial de layout */
 async function ocrImages(images, onProgress){
-  // Carrega Tesseract.js dinamicamente apenas se necessário
   if (!window.Tesseract){
     onProgress(20, 'Carregando motor OCR (Tesseract.js)…');
     await new Promise((res, rej) => {
@@ -306,16 +409,18 @@ async function ocrImages(images, onProgress){
   const worker = await Tesseract.createWorker('por+eng', 1, {
     logger: m => {
       if (m.status === 'recognizing text')
-        onProgress(70 + Math.round(m.progress*25), `OCR: ${Math.round(m.progress*100)}%…`);
+        onProgress(70 + Math.round(m.progress * 25), `OCR: ${Math.round(m.progress*100)}%…`);
     }
   });
-  let text = '';
+  let allText = '';
   for (const img of images){
     const result = await worker.recognize(img);
-    text += result.data.text + '\n';
+    // Usa bounding boxes para reconstruir layout espacial
+    const reconstructed = reconstructLinesFromWords(result.data.words);
+    allText += fixOcrChords(reconstructed) + '\n\n';
   }
   await worker.terminate();
-  return text.trim();
+  return allText.trim();
 }
 
 /* =====================================================
