@@ -81,9 +81,49 @@ def transpose_token(tok, n, flat):
     if has_close: result = result + ')'
     return result
 
+def normalize_music_symbols(text):
+    """Normaliza símbolos musicais Unicode para ASCII."""
+    return (text
+        .replace('♯', '#').replace('♭', 'b')
+        .replace('𝄪', '##').replace('𝄫', 'bb')
+        .replace('°', 'dim').replace('ø', 'm7b5'))
+
 def is_chord(tok):
-    """Verifica se um token é um acorde válido (ignora parênteses externos)."""
-    return bool(CHORD_RE.match(tok.strip()))
+    """Verifica se um token é um acorde válido (normaliza Unicode antes)."""
+    return bool(CHORD_RE.match(normalize_music_symbols(tok.strip())))
+
+def transpose_token(tok, n, flat):
+    """
+    Transpõe um acorde preservando qualidade, parênteses e extensões.
+    Normaliza Unicode, transpõe e retorna em notação ASCII padrão.
+    """
+    has_open  = tok.startswith('(')
+    has_close = tok.endswith(')')
+    clean = normalize_music_symbols(tok.strip('()'))
+
+    m = re.match(r'^([A-G][#b]?)([^/]*)((?:\/[A-G0-9#b][^\s]*)*)?$', clean)
+    if not m:
+        return tok
+
+    new_root = transpose_root(m.group(1), n, flat)
+    quality  = m.group(2) or ''
+    slashes  = m.group(3) or ''
+
+    def handle_slash(s):
+        if not s: return ''
+        out = ''
+        for part in re.findall(r'\/[^/]+', s):
+            nm = re.match(r'^\/([A-G][#b]?)(.*)$', part)
+            if nm:
+                out += '/' + transpose_root(nm.group(1), n, flat) + nm.group(2)
+            else:
+                out += part
+        return out
+
+    result = new_root + quality + handle_slash(slashes)
+    if has_open:  result = '(' + result
+    if has_close: result = result + ')'
+    return result
 
 def key_interval(src, dst):
     def root(k):
@@ -162,6 +202,16 @@ def is_chord_line(spans):
 # TRANSPOSIÇÃO — PDF COM TEXTO (in-place via pymupdf)
 # ================================================================
 
+def transpose_span_text(text, interval, flat):
+    """
+    Transpõe acordes num texto preservando EXATAMENTE o espaçamento original.
+    Usa re.sub para substituir apenas os tokens sem mexer nos espaços.
+    """
+    def replace_tok(m):
+        tok = m.group(0)
+        return transpose_token(tok, interval, flat) if is_chord(tok) else tok
+    return re.sub(r'\S+', replace_tok, normalize_music_symbols(text))
+
 def transpose_text_pdf(doc, interval, flat):
     for page in doc:
         spans  = extract_spans(page)
@@ -171,30 +221,26 @@ def transpose_text_pdf(doc, interval, flat):
         for line in lines:
             if not is_chord_line(line): continue
             for sp in line:
-                tokens = sp["text"].split()
-                new_tokens, changed = [], False
-                for tok in tokens:
-                    if is_chord(tok):
-                        nt = transpose_token(tok, interval, flat)
-                        new_tokens.append(nt)
-                        if nt != tok: changed = True
-                    else:
-                        new_tokens.append(tok)
-                if changed:
+                orig_text = sp["text"]
+                new_text  = transpose_span_text(orig_text, interval, flat)
+                if new_text.strip() != normalize_music_symbols(orig_text).strip():
                     changes.append({
-                        "rect":     fitz.Rect(sp["bbox"]),
-                        "new_text": " ".join(new_tokens),
-                        "size":     sp["size"],
-                        "flags":    sp.get("flags", 0),
-                        "color":    sp["color"],
+                        "rect":      fitz.Rect(sp["bbox"]),
+                        "new_text":  new_text,
+                        "orig_text": orig_text,
+                        "size":      sp["size"],
+                        "flags":     sp.get("flags", 0),
+                        "color":     sp["color"],
                     })
 
         if not changes: continue
 
+        # Passo 1 — redacionar acordes originais
         for ch in changes:
             page.add_redact_annot(ch["rect"], fill=(1, 1, 1))
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
+        # Passo 2 — reinserir texto transposto ajustando fonte para caber na caixa
         for ch in changes:
             flags  = ch["flags"]
             bold   = bool(flags & (1 << 4))
@@ -207,11 +253,21 @@ def transpose_text_pdf(doc, interval, flat):
             c_int = ch["color"]
             color = ((c_int>>16&0xFF)/255, (c_int>>8&0xFF)/255, (c_int&0xFF)/255)
             rect  = ch["rect"]
+
+            # Reduz fonte proporcionalmente se o novo texto for mais longo
+            orig_chars = max(len(ch["orig_text"].strip()), 1)
+            new_chars  = max(len(ch["new_text"].strip()),  1)
+            box_width  = rect.x1 - rect.x0
+            # Courier: ~0.6 * font_size por caractere
+            fit_size = min(ch["size"],
+                           box_width / (new_chars * 0.6)) if box_width > 0 else ch["size"]
+            fit_size = max(fit_size, ch["size"] * 0.70)   # nunca abaixo de 70%
+
             page.insert_text(
                 fitz.Point(rect.x0, rect.y1 - 1),
                 ch["new_text"],
                 fontname=fname,
-                fontsize=ch["size"],
+                fontsize=fit_size,
                 color=color,
             )
     return doc
