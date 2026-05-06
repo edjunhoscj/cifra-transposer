@@ -652,7 +652,7 @@ async function handleFile(file){
       const chordLines = rawText.split('\n').filter(isChordLine);
       const hasEnoughText = chordLines.length >= 2 || rawText.replace(/\s/g,'').length > 80;
 
-      let cifraText = rawText;
+      let cifraText = fixOcrChords(rawText); // corrige artefatos mesmo em PDFs com texto
 
       if (!hasEnoughText){
         // 3. Fallback: renderiza páginas → OCR com Tesseract.js
@@ -688,30 +688,69 @@ function doTranspose(){
 
 function downloadPDF(){
   const {jsPDF} = window.jspdf;
-  const doc = new jsPDF({unit:'mm', format:'a4'});
-  const margin=14, maxW=doc.internal.pageSize.getWidth()-margin*2;
-  let y=18;
+  const doc    = new jsPDF({unit:'mm', format:'a4'});
+  const margin = 15;
+  const maxW   = doc.internal.pageSize.getWidth() - margin * 2;
+  let y = 14;
 
-  // Cabeçalho com info de transposição
-  doc.setFont('helvetica','bold');
-  doc.setFontSize(8);
-  doc.setTextColor(150);
-  doc.text(`Tom transposto: ${S.srcKey} → ${S.targetKey}  |  gerado por Transpositor de Cifras`, margin, 10);
+  // Cabeçalho discreto
+  doc.setFont('helvetica','italic');
+  doc.setFontSize(7.5);
+  doc.setTextColor(180);
+  doc.text(`Tom: ${S.srcKey} → ${S.targetKey}  |  Transpositor de Cifras`, margin, y);
   doc.setTextColor(0);
+  y += 8;
 
-  S.transposedText.split('\n').forEach((line, li)=>{
-    if (y>278){ doc.addPage(); y=15; }
-    const isTitle   = li===0 && line.trim().length>0;
-    const isSection = /^\[.+\]$/.test(line) || /^(Intro|Vers[oa]|Refrão|Ponte|Coda|Solo|Pré-refrão|Bridge)[\s:]/i.test(line);
-    doc.setFont('courier', isTitle||isSection?'bold':'normal');
-    doc.setFontSize(isTitle?15 : isSection?11 : 10);
-    doc.splitTextToSize(line||' ', maxW).forEach(wl=>{
-      if (y>278){ doc.addPage(); y=15; }
-      doc.text(wl, margin, y);
-      y += isTitle?8 : 5.5;
+  const lines = S.transposedText.split('\n');
+
+  lines.forEach((line, li) => {
+    if (y > 280){ doc.addPage(); y = 14; }
+
+    const trimmed  = line.trim();
+    const isEmpty  = trimmed.length === 0;
+
+    if (isEmpty){ y += 3.5; return; }
+
+    // Detecta tipo de linha
+    const isTitle   = li <= 1 && trimmed.length > 0 && !isChordLine(line);
+    const isSection = /^\[.+\]$/.test(trimmed) ||
+                      /^(Intro|Vers[oa]|Refrão|Coro|Ponte|Coda|Solo|Pré|Bridge)[\s:\-]/i.test(trimmed);
+    const isChord   = isChordLine(line);
+
+    // Fonte: itálica como o original
+    if (isTitle){
+      doc.setFont('courier','bolditalic');
+      doc.setFontSize(13);
+      doc.setTextColor(0);
+    } else if (isSection){
+      doc.setFont('courier','bolditalic');
+      doc.setFontSize(10);
+      doc.setTextColor(80, 80, 80);
+    } else if (isChord){
+      // Acordes em preto, itálico — mesma fonte do original
+      doc.setFont('courier','italic');
+      doc.setFontSize(10);
+      doc.setTextColor(0);
+    } else {
+      // Letra em azul escuro itálico — como no original
+      doc.setFont('courier','italic');
+      doc.setFontSize(10);
+      doc.setTextColor(30, 70, 160);
+    }
+
+    // Preserva indentação convertendo espaços em posição X
+    const leadingSpaces = line.length - line.trimStart().length;
+    const xOffset = margin + leadingSpaces * 2.1; // ~2.1mm por espaço em Courier 10pt
+    const availW  = maxW - (xOffset - margin);
+
+    doc.splitTextToSize(trimmed, availW).forEach((wl, wi) => {
+      if (y > 280){ doc.addPage(); y = 14; }
+      doc.text(wl, wi === 0 ? xOffset : margin, y);
+      y += isTitle ? 7 : 5;
     });
   });
 
+  doc.setTextColor(0);
   const name = (S.fileName.replace('.pdf','') || 'cifra').replace(/[^\w\sÀ-ÿ]/g,'').trim();
   doc.save(`${name}_tom_${S.targetKey}.pdf`);
 }
