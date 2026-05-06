@@ -212,64 +212,116 @@ def transpose_span_text(text, interval, flat):
         return transpose_token(tok, interval, flat) if is_chord(tok) else tok
     return re.sub(r'\S+', replace_tok, normalize_music_symbols(text))
 
-def transpose_text_pdf(doc, interval, flat):
-    for page in doc:
-        spans  = extract_spans(page)
-        lines  = group_lines(spans)
-        changes = []
+def group_word_lines(words, y_tol=5):
+    """Agrupa palavras em linhas por posição Y."""
+    if not words: return []
+    s = sorted(words, key=lambda w: (w["y0"], w["x0"]))
+    lines, cur = [], [s[0]]
+    for w in s[1:]:
+        cy_p = (cur[-1]["y0"] + cur[-1]["y1"]) / 2
+        cy_c = (w["y0"] + w["y1"]) / 2
+        if abs(cy_c - cy_p) <= y_tol * 2:
+            cur.append(w)
+        else:
+            lines.append(sorted(cur, key=lambda x: x["x0"]))
+            cur = [w]
+    lines.append(sorted(cur, key=lambda x: x["x0"]))
+    return lines
 
-        for line in lines:
-            if not is_chord_line(line): continue
-            for sp in line:
-                orig_text = sp["text"]
-                new_text  = transpose_span_text(orig_text, interval, flat)
-                if new_text.strip() != normalize_music_symbols(orig_text).strip():
-                    changes.append({
-                        "rect":      fitz.Rect(sp["bbox"]),
-                        "new_text":  new_text,
-                        "orig_text": orig_text,
-                        "size":      sp["size"],
-                        "flags":     sp.get("flags", 0),
-                        "color":     sp["color"],
-                    })
+def get_dominant_chord_size(page):
+    """Tamanho de fonte dominante dos spans na página."""
+    from collections import Counter
+    sizes = []
+    for blk in page.get_text("dict")["blocks"]:
+        if blk.get("type") != 0: continue
+        for line in blk["lines"]:
+            for sp in line["spans"]:
+                if sp["text"].strip():
+                    sizes.append(round(sp["size"]))
+    return Counter(sizes).most_common(1)[0][0] if sizes else 10
+
+def transpose_text_pdf(doc, interval, flat):
+    """
+    Transpõe acordes usando get_text('words') que agrupa glyphs em palavras,
+    resolvendo G + #m7 separados → G#m7 como uma palavra.
+    """
+    for page in doc:
+        raw = page.get_text("words")  # (x0,y0,x1,y1,word,blk,ln,wn)
+        if not raw: continue
+
+        words = [{"text": normalize_music_symbols(w[4]),
+                  "x0": w[0], "y0": w[1], "x1": w[2], "y1": w[3]}
+                 for w in raw if w[4].strip()]
+
+        lines = group_word_lines(words)
+
+        # Obtém info de estilo e cor dos spans
+        page_size = get_dominant_chord_size(page)
+        spans = extract_spans(page)
+
+        def best_span_for(x, y):
+            best, dist = None, 1e9
+            for sp in spans:
+                bx0,by0,bx1,by1 = sp["bbox"]
+                d = abs(by0-y) + abs(bx0-x)*0.1
+                if d < dist:
+                    dist = d
+                    best = sp
+            return best
+
+        changes = []
+        for wline in lines:
+            tokens = [w["text"] for w in wline]
+            if not tokens: continue
+            hits = sum(1 for t in tokens if is_chord(t))
+            if hits / len(tokens) < 0.4: continue
+            if not re.match(r'^[\(]?[A-G]', tokens[0]): continue
+
+            # Tamanho consistente para a linha inteira
+            heights = [w["y1"]-w["y0"] for w in wline if w["y1"]>w["y0"]]
+            line_size = round(sorted(heights)[len(heights)//2] * 0.85) if heights else page_size
+            line_size = max(line_size, 6)
+
+            for w in wline:
+                if not is_chord(w["text"]): continue
+                transposed = transpose_token(w["text"], interval, flat)
+                if transposed == w["text"]: continue
+
+                sp = best_span_for(w["x0"], w["y0"])
+                sp_color = sp["color"] if sp else 0
+                sp_flags = sp.get("flags",0) if sp else 0
+
+                box_w = max(w["x1"] - w["x0"], 1)
+                fit_size = min(line_size, box_w / (max(len(transposed),1) * 0.6))
+                fit_size = max(fit_size, line_size * 0.72)
+
+                changes.append({
+                    "rect":     fitz.Rect(w["x0"], w["y0"], w["x1"], w["y1"]),
+                    "new_text": transposed,
+                    "size":     fit_size,
+                    "flags":    sp_flags,
+                    "color":    sp_color,
+                })
 
         if not changes: continue
 
-        # Passo 1 — redacionar acordes originais
         for ch in changes:
-            page.add_redact_annot(ch["rect"], fill=(1, 1, 1))
+            page.add_redact_annot(ch["rect"], fill=(1,1,1))
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
-        # Passo 2 — reinserir texto transposto ajustando fonte para caber na caixa
         for ch in changes:
-            flags  = ch["flags"]
-            bold   = bool(flags & (1 << 4))
-            italic = bool(flags & (1 << 1))
-            if   bold and italic: fname = "courier-boldoblique"
-            elif bold:            fname = "courier-bold"
-            elif italic:          fname = "courier-oblique"
-            else:                 fname = "courier"
-
-            c_int = ch["color"]
-            color = ((c_int>>16&0xFF)/255, (c_int>>8&0xFF)/255, (c_int&0xFF)/255)
-            rect  = ch["rect"]
-
-            # Reduz fonte proporcionalmente se o novo texto for mais longo
-            orig_chars = max(len(ch["orig_text"].strip()), 1)
-            new_chars  = max(len(ch["new_text"].strip()),  1)
-            box_width  = rect.x1 - rect.x0
-            # Courier: ~0.6 * font_size por caractere
-            fit_size = min(ch["size"],
-                           box_width / (new_chars * 0.6)) if box_width > 0 else ch["size"]
-            fit_size = max(fit_size, ch["size"] * 0.70)   # nunca abaixo de 70%
-
-            page.insert_text(
-                fitz.Point(rect.x0, rect.y1 - 1),
-                ch["new_text"],
-                fontname=fname,
-                fontsize=fit_size,
-                color=color,
-            )
+            f = ch["flags"]
+            bold, italic = bool(f&(1<<4)), bool(f&(1<<1))
+            if bold and italic: fname="courier-boldoblique"
+            elif bold:          fname="courier-bold"
+            elif italic:        fname="courier-oblique"
+            else:               fname="courier"
+            c = ch["color"]
+            color=((c>>16&0xFF)/255,(c>>8&0xFF)/255,(c&0xFF)/255)
+            rect=ch["rect"]
+            page.insert_text(fitz.Point(rect.x0,rect.y1-1),
+                             ch["new_text"],fontname=fname,
+                             fontsize=ch["size"],color=color)
     return doc
 
 
@@ -328,7 +380,6 @@ def transpose_scanned_pdf(doc, interval, flat):
         pw, ph = page.rect.width, page.rect.height
         c.setPageSize((pw, ph))
 
-        # Página original como fundo
         mat = fitz.Matrix(2, 2)
         pix = page.get_pixmap(matrix=mat)
         c.drawImage(ImageReader(io.BytesIO(pix.tobytes("png"))),
@@ -340,12 +391,29 @@ def transpose_scanned_pdf(doc, interval, flat):
             continue
 
         lines = group_ocr_lines(words)
+
+        # Tamanho de fonte consistente = mediana das alturas das palavras em linhas de acordes
+        chord_heights = []
         for line in lines:
             tokens = [w["text"] for w in line]
             if not tokens: continue
             hits = sum(1 for t in tokens if is_chord(t))
-            if hits / len(tokens) < 0.5 or not re.match(r'^[A-G]', tokens[0]):
-                continue
+            if hits/len(tokens) >= 0.4 and re.match(r'^[\(]?[A-G]', tokens[0]):
+                for w in line:
+                    h = w["y1"] - w["y0"]
+                    if h > 2: chord_heights.append(h)
+
+        base_size = round(sorted(chord_heights)[len(chord_heights)//2] * 0.82) \
+                    if chord_heights else 9
+        base_size = max(base_size, 7)
+
+        for line in lines:
+            tokens = [w["text"] for w in line]
+            if not tokens: continue
+            hits = sum(1 for t in tokens if is_chord(t))
+            if hits / len(tokens) < 0.4: continue
+            if not re.match(r'^[\(]?[A-G]', tokens[0]): continue
+
             for w in line:
                 if not is_chord(w["text"]): continue
                 transposed = transpose_token(w["text"], interval, flat)
@@ -354,13 +422,18 @@ def transpose_scanned_pdf(doc, interval, flat):
                 x0, x1 = w["x0"], w["x1"]
                 y0, y1 = w["y0"], w["y1"]
                 h = y1 - y0
-                rl_bot  = ph - y1
-                rl_text = ph - y0 - h * 0.15
 
+                rl_bot  = ph - y1
+                rl_text = ph - y0 - h * 0.12
+
+                # Cobre original com margem extra
+                pad = 1.5
                 c.setFillColorRGB(1, 1, 1)
-                c.rect(x0-1, rl_bot-1, (x1-x0)+2, h+2, fill=1, stroke=0)
+                c.rect(x0-pad, rl_bot-pad, (x1-x0)+pad*2, h+pad*2, fill=1, stroke=0)
+
+                # Texto transposto com tamanho consistente
                 c.setFillColorRGB(0, 0, 0)
-                c.setFont("Courier-Oblique", max(round(h * 0.72), 7))
+                c.setFont("Courier-Oblique", base_size)
                 c.drawString(x0, rl_text, transposed)
 
         c.showPage()
