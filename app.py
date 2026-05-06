@@ -373,17 +373,46 @@ def transpose_scanned_pdf(doc, interval, flat):
 # PIPELINE PRINCIPAL
 # ================================================================
 
-def has_text(doc, min_chars=60):
-    return sum(len(p.get_text().strip()) for p in doc) >= min_chars
+def has_complex_encoding(doc):
+    """
+    Detecta PDFs onde # e ♯ são spans separados da nota (fontes musicais especiais).
+    Nesses casos, 'G#m7' é armazenado como 'G' + '#m7' — o processamento
+    in-place não funciona e precisamos usar OCR overlay.
+    """
+    for page in doc:
+        for blk in page.get_text("dict")["blocks"]:
+            if blk.get("type") != 0:
+                continue
+            for line in blk["lines"]:
+                texts = [sp["text"].strip() for sp in line["spans"]]
+                for i, t in enumerate(texts):
+                    # '#' ou '♯' isolado logo após uma nota (A-G)
+                    if t in ('#', '♯', '♯') and i > 0 and texts[i-1] in set('ABCDEFG'):
+                        return True
+    return False
 
-def run_transpose(pdf_bytes, from_key, to_key, progress_bar):
+def has_text(doc, min_chars=60):
+    """
+    Retorna True apenas se o PDF tem texto extraível E codificação simples.
+    PDFs com codificação complexa (# separado) são roteados para OCR.
+    """
+    total = sum(len(p.get_text().strip()) for p in doc)
+    if total < min_chars:
+        return False
+    if has_complex_encoding(doc):
+        return False   # força OCR overlay
+    return True
+
+def run_transpose(pdf_bytes, from_key, to_key, progress_bar, force_ocr=False):
     interval = key_interval(from_key, to_key)
     flat     = to_key in FLAT_KEYS
     doc      = fitz.open(stream=pdf_bytes, filetype="pdf")
 
     progress_bar.progress(10, "Analisando PDF…")
 
-    if has_text(doc):
+    use_ocr = force_ocr or not has_text(doc)
+
+    if not use_ocr:
         progress_bar.progress(30, "Transpondo PDF com texto…")
         transpose_text_pdf(doc, interval, flat)
         progress_bar.progress(90, "Salvando…")
@@ -391,7 +420,7 @@ def run_transpose(pdf_bytes, from_key, to_key, progress_bar):
         doc.save(buf, garbage=4, deflate=True)
         result = buf.getvalue()
     else:
-        progress_bar.progress(20, "PDF escaneado detectado — iniciando OCR…")
+        progress_bar.progress(20, "PDF com codificação especial — usando OCR overlay…")
         try:
             result = transpose_scanned_pdf(doc, interval, flat)
         except ImportError as e:
@@ -460,9 +489,16 @@ if uploaded:
     else:
         st.info(f"🎵 Transpor  **{src}  →  {dst}**")
 
+        force_ocr = st.checkbox(
+            "🔬 Forçar modo OCR",
+            value=(pdf_type == "escaneado (OCR)"),
+            help="Use se os acordes saírem com # duplicados ou mal formados. "
+                 "O OCR lê o visual da página em vez da estrutura interna do PDF."
+        )
+
         if st.button("🔀 Transpor e Baixar", type="primary", use_container_width=True):
             prog = st.progress(0, "Iniciando…")
-            result = run_transpose(pdf_bytes, src, dst, prog)
+            result = run_transpose(pdf_bytes, src, dst, prog, force_ocr=force_ocr)
 
             if result:
                 out_name = uploaded.name.replace(".pdf", f"_tom_{dst}.pdf")
