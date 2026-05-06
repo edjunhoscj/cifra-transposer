@@ -19,10 +19,23 @@ NOTE_SEMI   = {
 }
 FLAT_KEYS = {'F','Bb','Eb','Ab','Db','Gb','Fm','Bbm','Ebm','Abm','Dbm','Gbm'}
 
+# Regex abrangente para cifras brasileiras:
+# Cobre: Am7, B7+, Cmaj7, D#m, F#7/9/4, (G#9), C/E, sus4, dim7, aug, etc.
 CHORD_RE = re.compile(
-    r'^([A-G][#b]?)'
-    r'(m(?:aj)?7?|min7?|M7?|maj7?|7|9|11|13|dim7?|aug|sus[24]?|add\d+|6|4|2)?'
-    r'(\([^)]*\))?(\/[A-G][#b]?)?$'
+    r'^\(?'                                     # parêntese opcional de abertura
+    r'([A-G][#b]?)'                             # nota raiz  ex: C, F#, Bb
+    r'('
+        r'm(?:aj)?7?\+?'                        # m, mm7, maj7, maj7+
+        r'|min7?\+?|M7?\+?|maj7?\+?'            # min, min7, M7, maj7
+        r'|7\+?|9\+?|11\+?|13\+?'              # 7, 7+, 9, 9+ ...
+        r'|dim7?|°7?'                           # dim, dim7, °
+        r'|aug|\+'                              # aug, + (aumentado)
+        r'|sus[24]?|add\d+'                     # sus, sus4, add9
+        r'|6|4|2'                               # 6a, 4a, 2a
+    r')?'
+    r'(\([^)]*\))?'                             # sufixo entre parênteses ex: (9)
+    r'((?:\/[A-G0-9#b][^\s/]*)*)?'             # extensões: /E, /9/4, /C#
+    r'\)?$'                                     # parêntese opcional de fechamento
 )
 
 def _semi(n):   return NOTE_SEMI.get(n, -1)
@@ -33,14 +46,43 @@ def transpose_root(root, n, flat):
     return root if s < 0 else _note(s + n, flat)
 
 def transpose_token(tok, n, flat):
-    m = re.match(r'^([A-G][#b]?)([^/]*)(\/([A-G][#b]?)(.*))?$', tok)
-    if not m: return tok
-    new = transpose_root(m.group(1), n, flat) + (m.group(2) or '')
-    if m.group(4):
-        new += '/' + transpose_root(m.group(4), n, flat) + (m.group(5) or '')
-    return new
+    """
+    Transpõe um acorde preservando qualidade, parênteses e extensões.
+    Trata /E (baixo) transpondo-o, mas /9/4 (extensões numéricas) mantém intacto.
+    """
+    # Preserva parênteses externos ex: (G#9)
+    has_open  = tok.startswith('(')
+    has_close = tok.endswith(')')
+    clean = tok.strip('()')
+
+    m = re.match(r'^([A-G][#b]?)([^/]*)((?:\/[A-G0-9#b][^\s]*)*)?$', clean)
+    if not m:
+        return tok
+
+    new_root = transpose_root(m.group(1), n, flat)
+    quality  = m.group(2) or ''
+    slashes  = m.group(3) or ''
+
+    # Transpõe apenas partes de barra que são notas musicais (A-G)
+    def handle_slash(s):
+        if not s:
+            return ''
+        out = ''
+        for part in re.findall(r'\/[^/]+', s):
+            note_m = re.match(r'^\/([A-G][#b]?)(.*)$', part)
+            if note_m:
+                out += '/' + transpose_root(note_m.group(1), n, flat) + note_m.group(2)
+            else:
+                out += part   # /9, /4 etc. — mantém como está
+        return out
+
+    result = new_root + quality + handle_slash(slashes)
+    if has_open:  result = '(' + result
+    if has_close: result = result + ')'
+    return result
 
 def is_chord(tok):
+    """Verifica se um token é um acorde válido (ignora parênteses externos)."""
     return bool(CHORD_RE.match(tok.strip()))
 
 def key_interval(src, dst):
@@ -55,11 +97,13 @@ def detect_key(text):
     roots, first = [], None
     for line in text.split('\n'):
         tokens = line.strip().split()
-        if not tokens or not re.match(r'^[A-G]', tokens[0]): continue
-        hits = sum(1 for t in tokens if is_chord(t))
-        if not tokens or hits / len(tokens) < 0.5: continue
-        for t in tokens:
-            m = re.match(r'^([A-G][#b]?)', t)
+        if not tokens or not re.match(r'^[\(]?[A-G]', tokens[0]): continue
+        meaningful = [t for t in tokens if len(t) >= 1 and not t.isdigit()]
+        if not meaningful: continue
+        hits = sum(1 for t in meaningful if is_chord(t))
+        if hits / len(meaningful) < 0.4: continue
+        for t in meaningful:
+            m = re.match(r'^\(?([A-G][#b]?)', t)
             if m and is_chord(t):
                 roots.append(m.group(1))
                 if first is None: first = m.group(1)
@@ -98,10 +142,20 @@ def group_lines(spans, y_tol=4):
     return lines
 
 def is_chord_line(spans):
+    """
+    Verifica se uma linha é predominantemente acordes.
+    Usa limiar 0.4 (40%) para tolerar notações complexas como F#7/9/4
+    que podem não ser reconhecidas pelo regex mas ainda indicam linha de acordes.
+    """
     tokens = [t for sp in spans for t in sp["text"].split()]
     if not tokens: return False
-    hits = sum(1 for t in tokens if is_chord(t))
-    return hits / len(tokens) >= 0.5 and bool(re.match(r'^[A-G]', tokens[0]))
+    # Filtra tokens muito curtos ou puramente numéricos
+    meaningful = [t for t in tokens if len(t) >= 1 and not t.isdigit()]
+    if not meaningful: return False
+    hits = sum(1 for t in meaningful if is_chord(t))
+    first_tok = meaningful[0]
+    starts_with_note = bool(re.match(r'^[\(]?[A-G][#b]?', first_tok))
+    return starts_with_note and hits / len(meaningful) >= 0.4
 
 
 # ================================================================
